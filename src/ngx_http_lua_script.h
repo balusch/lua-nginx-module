@@ -16,6 +16,7 @@ typedef struct {
     ngx_pool_t                 *pool;
     ngx_str_t                  *source;
 
+    // QUESTION: 为什么一定要二级指针？一级的不行么？
     ngx_array_t               **lengths;
     ngx_array_t               **values;
 
@@ -57,6 +58,7 @@ typedef struct {
 } ngx_http_lua_script_engine_t;
 
 
+// TODO: 改成 ngx_http_lua_script_content_code_pt ?
 typedef void (*ngx_http_lua_script_code_pt) (ngx_http_lua_script_engine_t *e);
 typedef size_t (*ngx_http_lua_script_len_code_pt)
     (ngx_http_lua_script_engine_t *e);
@@ -76,6 +78,7 @@ typedef struct {
 
 ngx_int_t ngx_http_lua_compile_complex_value(
     ngx_http_lua_compile_complex_value_t *ccv);
+// QUESTION: 下面这个函数改成 ngx_http_lua_evaluate_complex_value ?
 ngx_int_t ngx_http_lua_complex_value(ngx_http_request_t *r, ngx_str_t *subj,
     size_t offset, ngx_int_t count, int *cap,
     ngx_http_lua_complex_value_t *val, luaL_Buffer *luabuf);

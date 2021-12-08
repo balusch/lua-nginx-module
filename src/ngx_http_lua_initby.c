@@ -19,6 +19,8 @@ ngx_http_lua_init_by_inline(ngx_log_t *log, ngx_http_lua_main_conf_t *lmcf,
 {
     int         status;
 
+    /* NOTE: 注意 OpenResty 是怎么给 inline lua code 取名字的，
+        由于 Lua 代码只能通过挂载到某个阶段执行，所以直接以名字表示 */
     status = luaL_loadbuffer(L, (char *) lmcf->init_src.data,
                              lmcf->init_src.len, "=init_by_lua")
              || ngx_http_lua_do_call(log, L);

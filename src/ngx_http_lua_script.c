@@ -58,6 +58,7 @@ ngx_http_lua_compile_complex_value(ngx_http_lua_compile_complex_value_t *ccv)
         return NGX_OK;
     }
 
+    // QUESTION: 每个 $ 对应两个 copy code 和一个 capture code?
     n = nv * (2 * sizeof(ngx_http_lua_script_copy_code_t)
               + sizeof(ngx_http_lua_script_capture_code_t))
         + sizeof(uintptr_t);
@@ -66,6 +67,8 @@ ngx_http_lua_compile_complex_value(ngx_http_lua_compile_complex_value_t *ccv)
         return NGX_ERROR;
     }
 
+    // NOTE: 把 nv * (2 * size(copy) + size(capture)) + size(uintptr) 向上取整为 uintptr 的倍数
+    // QUESTION: 但是为什么 lengths 不用呢？ 而且我自己写了个 demo，不取整也是可以工作的，所以是为了性能？
     n = (nv * (2 * sizeof(ngx_http_lua_script_copy_code_t)
                    + sizeof(ngx_http_lua_script_capture_code_t))
                 + sizeof(uintptr_t)
@@ -132,6 +135,9 @@ ngx_http_lua_complex_value(ngx_http_request_t *r, ngx_str_t *subj,
     len = 0;
 
     while (*(uintptr_t *) e.ip) {
+        // NOTE: e.ip 的步进不是以 copy/capture code 为单位，而是每次(明面上)步进一个 uintptr
+        //       while 循环时从 e.ip 拿到的总是 code 的首地址，也就是 code 中的 xxx_pt 函数，
+        //       在 pt 函数中会将 e.ip 跳过合适的长度
         lcode = *(ngx_http_lua_script_len_code_pt *) e.ip;
         len += lcode(&e);
     }
@@ -146,7 +152,7 @@ ngx_http_lua_complex_value(ngx_http_request_t *r, ngx_str_t *subj,
 
     while (*(uintptr_t *) e.ip) {
         code = *(ngx_http_lua_script_code_pt *) e.ip;
-        code((ngx_http_lua_script_engine_t *) &e);
+        code((ngx_http_lua_script_engine_t *) &e); // QUESTION 为啥不直接 code(&e)?
     }
 
     luaL_addlstring(luabuf, (char *) &subj->data[offset], cap[0] - offset);
@@ -261,7 +267,7 @@ ngx_http_lua_script_compile(ngx_http_lua_script_compile_t *sc)
                 return NGX_ERROR;
             }
 
-            if (name.len == 0) {
+            if (name.len == 0) { // ${} 的情况？
                 goto invalid_variable;
             }
 
@@ -333,6 +339,8 @@ ngx_http_lua_script_add_copy_code(ngx_http_lua_script_compile_t *sc,
                  ngx_http_lua_script_copy_len_code;
     code->len = len;
 
+    // 对 size(copy) + len 向上取整到 uintptr 的倍数
+    // QUESTION: 这个是必须的吗？
     size = (sizeof(ngx_http_lua_script_copy_code_t) + len +
             sizeof(uintptr_t) - 1) & ~(sizeof(uintptr_t) - 1);
 
@@ -429,6 +437,7 @@ ngx_http_lua_script_copy_capture_len_code(ngx_http_lua_script_engine_t *e)
 
     n = code->n;
 
+    // NOTE: 对于超出范围的，比如 exec 返回 3（表示最大的 capture 编号为 2）
     if (n < e->ncaptures) {
         cap = e->captures;
         return cap[n + 1] - cap[n];
@@ -459,6 +468,7 @@ ngx_http_lua_script_copy_capture_code(ngx_http_lua_script_engine_t *e)
         cap = e->captures;
         p = e->captures_data;
 
+        // QUESTION: cap[n]/cap[n+1]不会可能为 -1 么？
         e->pos = ngx_copy(pos, &p[cap[n]], cap[n + 1] - cap[n]);
     }
 

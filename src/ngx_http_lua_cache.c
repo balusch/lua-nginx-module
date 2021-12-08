@@ -168,6 +168,13 @@ ngx_http_lua_cache_store_code(lua_State *L, int *ref, const char *key)
 
     lua_pushvalue(L, -2); /* closure cache closure */
 
+    /* QUESTION: 为啥要 cache by key 又要 cache by reference?
+     *
+     * NOTE: cache by key 和 cache by key 两种情况 code 存储的位置不同
+     *  cache by key: registry[code_cache_key][key] = code
+     *  cache by ref: registry[code_cache_key][key] = ref, L[ref] = code
+     */
+
     if (*ref == LUA_NOREF) {
         /*  cache closure by cache key */
         lua_setfield(L, -2, key); /* closure cache */
@@ -185,6 +192,11 @@ ngx_http_lua_cache_store_code(lua_State *L, int *ref, const char *key)
     lua_pop(L, 1); /* closure */
 
 #ifndef OPENRESTY_LUAJIT
+
+    /* QUESTION: 这里为啥要调用 closure 呢？这不就直接运行用户写在 nginx.conf 里面的代码了么？
+        还是说这里说的 closure factory 和用户代码是不同的? 比如说 content_by_lua_block 这个
+        指令，会被实现成一个 closure factory，然后调用它生成的就是表示用户代码的 closure ?*/
+
     /*  call closure factory to generate new closure */
     rc = lua_pcall(L, 0, 1, 0);
     if (rc != 0) {

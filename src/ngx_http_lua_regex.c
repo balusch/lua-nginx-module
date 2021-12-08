@@ -282,10 +282,12 @@ ngx_http_lua_ngx_re_match_helper(lua_State *L, int wantcaps)
                re->ncaptures, re->captures);
 
             re_comp.regex = re->regex;
+            re_comp.captures = re->ncaptures;
             sd = re->regex_sd;
             re_comp.captures = re->ncaptures;
             cap = re->captures;
 
+            // QUESTION: 这里不用重写 re_comp.captures?
             if (flags & NGX_LUA_RE_MODE_DFA) {
                 ovecsize = 2;
 
@@ -339,6 +341,7 @@ ngx_http_lua_ngx_re_match_helper(lua_State *L, int wantcaps)
 
     ngx_http_lua_pcre_malloc_done(old_pool);
 
+    // NOTE: goto error 主要是为了是释放内存，而这里还没有开始分配(本身 or PCRE)，所以直接返回即可
     if (rc != NGX_OK) {
         dd("compile failed");
 
@@ -449,6 +452,7 @@ ngx_http_lua_ngx_re_match_helper(lua_State *L, int wantcaps)
 
         re = ngx_palloc(pool, sizeof(ngx_http_lua_regex_t));
         if (re == NULL) {
+            // QUESTION: 需要清除 'o' 标志吧？不然不会释放 pcre *？
             msg = "no memory";
             goto error;
         }
@@ -538,6 +542,8 @@ exec:
             ngx_pfree(pool, cap);
         }
 
+        // QUESTION: 为什么有的地方返回 2（pushnil两次），但是这里只需要一次？
+        // 而且不 lua_pushnil，直接 return 0 不行么？lua 不是多退少补？
         lua_pushnil(L);
         return 1;
     }
@@ -548,6 +554,12 @@ exec:
     }
 
     if (rc == 0) {
+
+        /* In DFA mode, if there were too many matches to fit
+           into ovector, the yield of pcre_dfa_exec() is zero,
+           and the vector is filled with the longest match, which
+           is exactly what we need, so we just ignore this error. */
+
         if (flags & NGX_LUA_RE_MODE_DFA) {
             rc = 1;
 
@@ -561,6 +573,8 @@ exec:
 
     if (has_ctx) { /* having ctx table */
         pos = cap[1];
+        // pos 需要被修改为本次匹配的下一个字符 lua 索引
+        // cap[1] 是一个 C index，表示本次匹配的下一个字符，所以需要 +1
         lua_pushinteger(L, (lua_Integer) (pos + 1));
         lua_setfield(L, 4, "pos");
     }
@@ -583,7 +597,7 @@ exec:
             int     from, to;
 
             from = cap[group_id * 2] + 1;
-            to = cap[group_id * 2 + 1];
+            to = cap[group_id * 2 + 1]; // NOTE: 返回的 to 不是【下一个字符的位置】，而是本次匹配的最后一个字符的位置，所以不用再加一
             if (from < 0 || to < 0) {
                 lua_pushnil(L);
                 lua_pushnil(L);
@@ -700,7 +714,7 @@ ngx_http_lua_ngx_re_gmatch(lua_State *L)
 
     if (nargs == 3) {
         opts.data = (u_char *) luaL_checklstring(L, 3, &opts.len);
-        lua_pop(L, 1);
+        lua_pop(L, 1); // QUESTION: 为什么一定要在这里 pop ？
 
     } else {
         opts.data = (u_char *) "";
@@ -900,7 +914,7 @@ ngx_http_lua_ngx_re_gmatch(lua_State *L)
 
     cap = ngx_palloc(pool, ovecsize * sizeof(int));
     if (cap == NULL) {
-        flags &= ~NGX_LUA_RE_COMPILE_ONCE;
+        flags &= ~NGX_LUA_RE_COMPILE_ONCE; // NOTE: 还没有存入 cache 之前，如果出现了错误，都得释放分配的内存
         msg = "no memory";
         goto error;
     }
@@ -929,7 +943,7 @@ ngx_http_lua_ngx_re_gmatch(lua_State *L)
 
         lua_pushlightuserdata(L, re); /* table key value */
         lua_rawset(L, -3); /* table */
-        lua_pop(L, 1);
+        lua_pop(L, 1); // QUESTION: 不 pop 不行么？
 
         if (lmcf) {
             lmcf->regex_cache_entries++;
@@ -942,14 +956,20 @@ compiled:
 
     ctx = lua_newuserdata(L, sizeof(ngx_http_lua_regex_ctx_t));
 
+    /* NOTE: ctx->request 记录下使用该 iterator 的请求，说明只能被一个请求使用么？*/
     ctx->request = r;
     ctx->regex = re_comp.regex;
     ctx->regex_sd = sd;
+    // TODO: 感觉这里命名比较混乱，比如按照 nginx 的惯例，captures 和 ncaptures
+    //  明显是一对，但是实际上 captures_len 和 captures 才是匹配的，所以如果是我，
+    //  我会把 captures 改成 ovector，captures_len 改成 ovecsize
     ctx->ncaptures = re_comp.captures;
     ctx->captures = cap;
     ctx->captures_len = ovecsize;
     ctx->flags = (uint8_t) flags;
 
+    // TODO: 确认下 lego 是否支持请求维度的 cleanup handler
+    //   看了一下 Request 结构的 dtor，应该是不支持
     if (!(flags & NGX_LUA_RE_COMPILE_ONCE)) {
         lua_createtable(L, 0 /* narr */, 1 /* nrec */); /* metatable */
         lua_pushcfunction(L, ngx_http_lua_ngx_re_gmatch_gc);
@@ -971,6 +991,10 @@ compiled:
     }
 
     lua_pushinteger(L, 0);
+
+    /* NOTE: upvalue 并不是我们调用各种特殊的 lua_pushUpvalueXXX() 创建的
+       而是和普通的变量一样被推入栈中，然后通过 lua_pushcclosure() 的第三个参数
+       指定哪些变量是 upvalue，Lua 会做特殊处理 */
 
     /* upvalues in order: subj ctx offset */
     lua_pushcclosure(L, ngx_http_lua_ngx_re_gmatch_iterator, 3);
@@ -999,6 +1023,7 @@ error:
 }
 
 
+// TODO: 阅读 PIL 中 iterator 章节，理解 iterator + for loop 的执行原理
 static int
 ngx_http_lua_ngx_re_gmatch_iterator(lua_State *L)
 {
@@ -1021,6 +1046,7 @@ ngx_http_lua_ngx_re_gmatch_iterator(lua_State *L)
     ctx = (ngx_http_lua_regex_ctx_t *) lua_touserdata(L, lua_upvalueindex(2));
     offset = (int) lua_tointeger(L, lua_upvalueindex(3));
 
+    // NOTE: iterator function 返回的第一个参数为 nil 就表示终止循环
     if (offset < 0) {
         lua_pushnil(L);
         return 1;
@@ -1094,12 +1120,19 @@ ngx_http_lua_ngx_re_gmatch_iterator(lua_State *L)
                                      exec_opts);
     }
 
+    // NOTE: iterator 到底了，如何终止 for loop？
     if (rc == NGX_REGEX_NO_MATCHED) {
         /* set upvalue "offset" to -1 */
         lua_pushinteger(L, -1);
         lua_replace(L, lua_upvalueindex(3));
 
+        // QUESTION: 如果一直没有到 NO_MATCH 的时候，比如迭代器走 3 步才匹配完毕，
+        // 但是我只调用了两次，所以一直不会走到这个逻辑，那么怎么才能清除数据呢？
+        // 虽然注册了 __gc 元方法，但是什么时候会调用呢？Lua 使用的是垃圾收集的方式，
+        // 应该是通过判断可达性来决定是否可以调用 __gc 方法，怎么才算是不可达呢？
+        // 此外，__gc 元方法中并没有清除 cap，在迭代器不走到终点的情况下是不是内存泄露了？
         if (!(ctx->flags & NGX_LUA_RE_COMPILE_ONCE)) {
+            // QUESTION: 不用清理 ctx->regex 么？
             if (ctx->regex_sd) {
                 ngx_http_lua_regex_free_study_data(r->pool, ctx->regex_sd);
                 ctx->regex_sd = NULL;
@@ -1122,6 +1155,7 @@ ngx_http_lua_ngx_re_gmatch_iterator(lua_State *L)
             rc = 1;
 
         } else {
+            // QUESTION: 为啥这里不说 captures is too small?
             goto error;
         }
     }
@@ -1152,14 +1186,16 @@ ngx_http_lua_ngx_re_gmatch_iterator(lua_State *L)
     }
 
     offset = cap[1];
-    if (offset == cap[0]) {
+    if (offset == cap[0]) { // NOTE: 特殊情况，防止无限循环
         offset++;
     }
 
+    // TODO: 为啥不用 >= ？
     if (offset > (ssize_t) subj.len) {
         offset = -1;
 
         if (!(ctx->flags & NGX_LUA_RE_COMPILE_ONCE)) {
+            // TODO: 为什么不 free ctx->regex
             if (ctx->regex_sd) {
                 ngx_http_lua_regex_free_study_data(r->pool, ctx->regex_sd);
                 ctx->regex_sd = NULL;
@@ -1652,6 +1688,7 @@ ngx_http_lua_ngx_re_sub_helper(lua_State *L, unsigned global)
 
         re = ngx_palloc(pool, sizeof(ngx_http_lua_regex_t));
         if (re == NULL) {
+            // TODO: ctpl->value.data 还没有释放吧？
             msg = "no memory";
             goto error;
         }
@@ -1809,17 +1846,39 @@ exec:
                     return luaL_argerror(L, 3, msg);
             }
 
+            // NOTE: 将栈顶元素(func result)移动到栈底，栈底及其之上的元素上移一个位置
+            //       这里主要是为了在连续两次循环之间，满足 luaL_Buffer 栈平衡的要求
+            // TODO: 后面得读一下 Lua 的代码，看看究竟是为什么
             lua_insert(L, 1);
+
+
+            /*
+             * ATTENTION: 上一轮匹配和这轮匹配之间跳过的内容需要保留
+             *
+             * local replace = function(m)
+             *     return cjson.encode(m)
+             * end
+             *
+             * local newstr, n, err = ngx.re.gsub("he123llo, wo123rld", "(([a-z]+)([0-9]+))", replace)
+             * ngx.say("newstr: ", newstr)
+             * -- newstr: {"0":"he123","1":"he123","2":"he","3":"123"}llo, {"0":"wo123","1":"wo123","2":"wo","3":"123"}rld
+             */
 
             luaL_addlstring(&luabuf, (char *) &subj.data[cp_offset],
                             cap[0] - cp_offset);
 
             luaL_addlstring(&luabuf, (char *) tpl.data, tpl.len);
 
+            // NOTE: 移除栈底元素，并且将栈底及其上的元素下移一个位置
+            //       栈底是 func result，lua_addlstring 完了之后就不需要了
             lua_remove(L, 1);
 
+            // QUESTION: cp_offset 和 offset 的区别是什么？为什么需要分两个字段？
+            // NOTE: 只有在匹配到了一个空的字符串的时候，cp_offset 和 offset 才会不一样
+            //       此时 cap[0] = cap[1] = cp_offset, len = 0, push
             cp_offset = cap[1];
             offset = cp_offset;
+            // QUESTION: ([0-9]{0-3}) 可能匹配到空的，导致 cap[1] == cap[0]
             if (offset == cap[0]) {
                 offset++;
                 if (offset > (ssize_t) subj.len) {
@@ -1861,7 +1920,7 @@ exec:
 
     if (count == 0) {
         dd("no match, just the original subject");
-        lua_settop(L, 1);
+        lua_settop(L, 1); // NOTE: 返回原值
 
     } else {
         if (offset < (int) subj.len) {
@@ -2082,6 +2141,9 @@ ngx_http_lua_ngx_re_gmatch_cleanup(void *data)
 {
     ngx_http_lua_regex_ctx_t    *ctx = data;
 
+    // NOTE: ctx 的内存是 Lua 分配的，所以只能由 Lua 来释放
+    //  C 需要/能做的的就是把 ctx 中的各个指针指向的由 C 分配的内存给释放掉
+    // TODO: 为什么没有 pfree(ctx->regex)?
     if (ctx) {
         if (ctx->regex_sd) {
             ngx_http_lua_regex_free_study_data(ctx->request->pool,
@@ -2090,7 +2152,7 @@ ngx_http_lua_ngx_re_gmatch_cleanup(void *data)
         }
 
         if (ctx->cleanup) {
-            *ctx->cleanup = NULL;
+            *ctx->cleanup = NULL; // TODO: 这样请求结束的时候就不会调用 cleanup handler 了
             ctx->cleanup = NULL;
         }
 
@@ -2101,14 +2163,17 @@ ngx_http_lua_ngx_re_gmatch_cleanup(void *data)
 }
 
 
+// QUESTION: 目前的 Lua 的 GC 还是使用垃圾收集的方式
 static int
 ngx_http_lua_ngx_re_gmatch_gc(lua_State *L)
 {
     ngx_http_lua_regex_ctx_t    *ctx;
 
+    // NOTE: __gc 元方法中如何获取需要 gc 的对象
     ctx = lua_touserdata(L, 1);
 
     if (ctx && ctx->cleanup) {
+        // TODO: 为啥不是 ctx->cleanup(ctx); 呢？不然在 ctx->cleanup = &cln->handler; 这句有什么意义呢？
         ngx_http_lua_ngx_re_gmatch_cleanup(ctx);
     }
 
@@ -2133,7 +2198,7 @@ ngx_http_lua_re_collect_named_captures(lua_State *L, int res_tb_idx,
         n = (name_entry[0] << 8) | name_entry[1];
         name = (char *) &name_entry[2];
 
-        lua_rawgeti(L, -1, n);
+        lua_rawgeti(L, -1, n); // QUESTION: 为什么这里不用 res_tb_idx ？
         if (lua_isnil(L, -1)) {
             lua_pop(L, 1);
             continue;
