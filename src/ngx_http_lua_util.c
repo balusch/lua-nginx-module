@@ -930,6 +930,8 @@ ngx_http_lua_discard_bufs(ngx_pool_t *pool, ngx_chain_t *in)
 }
 
 
+/* NOTE: 目前这个函数只在 capture body filter 中使用，主要是用来将子请求的 body 数据
+    拷贝到子请求的 ctx 中去，后续交由用户自行处理 */
 ngx_int_t
 ngx_http_lua_add_copy_chain(ngx_http_request_t *r, ngx_http_lua_ctx_t *ctx,
     ngx_chain_t ***plast, ngx_chain_t *in, ngx_int_t *eof)
@@ -946,6 +948,10 @@ ngx_http_lua_add_copy_chain(ngx_http_request_t *r, ngx_http_lua_ctx_t *ctx,
             len += cl->buf->last - cl->buf->pos;
         }
 
+        /* NOTE: last_in_chain 表示该 buf 在当前 ngx_chain_t 中为最后一个 buf，
+                 last_buf 针对的是数据以多个 chain 链表传递的情况，它表示在所有
+                 chain 链表中为最后一个，字段具体含义可以参考:
+                 https://www.nginx.com/resources/wiki/extending/api/alloc/ */
         if (cl->buf->last_in_chain || cl->buf->last_buf) {
             *eof = 1;
         }
@@ -975,6 +981,7 @@ ngx_http_lua_add_copy_chain(ngx_http_request_t *r, ngx_http_lua_ctx_t *ctx,
         in = in->next;
     }
 
+    /* NOTE: 注意理解下面两句的含义 */
     **plast = cl;
     *plast = &cl->next;
 
@@ -1110,6 +1117,7 @@ ngx_int_t
 ngx_http_lua_run_thread(lua_State *L, ngx_http_request_t *r,
     ngx_http_lua_ctx_t *ctx, volatile int nrets)
 {
+    /* REF: https://catbro666.github.io/posts/150430f0/ */
     ngx_http_lua_co_ctx_t   *next_coctx, *parent_coctx, *orig_coctx;
     int                      rv, success = 1;
     lua_State               *next_co;
@@ -1226,6 +1234,7 @@ ngx_http_lua_run_thread(lua_State *L, ngx_http_request_t *r,
                     return ngx_http_lua_handle_exec(L, r, ctx);
                 }
 
+                /* TODO: 下面的 switch-case 没有看懂，不理解这几个 case 的含义 */
                 /*
                  * check if coroutine.resume or coroutine.yield called
                  * lua_yield()
@@ -1349,7 +1358,7 @@ ngx_http_lua_run_thread(lua_State *L, ngx_http_request_t *r,
                 /* try resuming on the new coroutine again */
                 continue;
 
-            case 0:
+            case 0: /* TODO: 0 是不是可以替换为 LUA_OK？ */
 
                 ngx_http_lua_cleanup_pending_operation(ctx->cur_co_ctx);
 

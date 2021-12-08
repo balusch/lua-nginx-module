@@ -110,6 +110,13 @@ ngx_http_lua_capture_header_filter(ngx_http_request_t *r)
 }
 
 
+/* NOTE: capture body filter 对于子请求，会将当前的 body 数据(in 链表) 以单个
+     buf/chain 的形式添加到 subrequest 结构中去(ctx->last_body/ctx->body)，
+     而不会直接发送数据，
+     这里并不用管子请求的顺序，因为处理的都是子请求本身的数据，后续再 resume_handler 中
+     会以数组的形式将各个子请求的数据结果返回给调用方，子请求本身并不具有发送数据的权利，
+     也不会说自动按照子请求创建的顺序发送数据(capture_multi 结构中也无法区分出子请求的顺序)
+     只有主请求才有发送数据的权利，且将数据的发送顺序交由用户自己决定 */
 static ngx_int_t
 ngx_http_lua_capture_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 {
@@ -157,6 +164,10 @@ ngx_http_lua_capture_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                    "lua capture body filter capturing response body, uri "
                    "\"%V\"", &r->uri);
 
+    /* NOTE: 由于响应数据很可能无法一次生产完全(比如 proxy_pass 通过网络从上游获取)，
+        所以 ngx_http_output_filter() 可能会被多次调用，capture body filter 也
+        是一样的，此时每来一份数据，我们就将其添加到 ctx->last_body chain 链表上去 */
+    /* QUESTION:我们不直接使用 in 链表，而是得拷贝一份(数据 + chain/buf 容器)？*/
     rc = ngx_http_lua_add_copy_chain(r, pr_ctx, &ctx->last_body, in, &eof);
     if (rc != NGX_OK) {
         return NGX_ERROR;

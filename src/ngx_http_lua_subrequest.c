@@ -4,6 +4,10 @@
  * Copyright (C) Yichun Zhang (agentzh)
  */
 
+/* REF: https://forum.openresty.us/d/651-4b2e0f1ece7b9c5a30e13e1ed3f752cf
+   REF: https://www.mail-archive.com/search?l=nginx%40nginx.org&q=subrequest
+   REF: https://www.mail-archive.com/search?l=nginx-devel%40nginx.org&q=subrequest
+   NOTE: 需要注意的是，lua 子请求和 nginx 本身的子请求是不兼容的 */
 
 #ifndef DDEBUG
 #define DDEBUG 0
@@ -181,6 +185,7 @@ ngx_http_lua_ngx_location_capture_multi(lua_State *L)
         return luaL_error(L, "no ctx found");
     }
 
+    /* NOTE: subrequest 只能在 rewrite/access/content 这几个阶段使用 */
     ngx_http_lua_check_context(L, ctx, NGX_HTTP_LUA_CONTEXT_REWRITE
                                | NGX_HTTP_LUA_CONTEXT_ACCESS
                                | NGX_HTTP_LUA_CONTEXT_CONTENT);
@@ -224,6 +229,7 @@ ngx_http_lua_ngx_location_capture_multi(lua_State *L)
     extra_vars = NULL;
 
     for (index = 0; index < nsubreqs; index++) {
+        /* TODO: 一开始就递增这个 pending_subreqs，要是后面出错了咋办？可以正确处理么？ */
         coctx->pending_subreqs++;
 
         lua_rawgeti(L, 1, index + 1);
@@ -250,7 +256,7 @@ ngx_http_lua_ngx_location_capture_multi(lua_State *L)
 
         dd("queries query uri: %d", lua_gettop(L));
 
-        dd("first arg in first query: %s", lua_typename(L, lua_type(L, -1)));
+        dd("first arg in query %d: %s", index, lua_typename(L, lua_type(L, -1)));
 
         body = NULL;
 
@@ -272,6 +278,8 @@ ngx_http_lua_ngx_location_capture_multi(lua_State *L)
 
             dd("queries query uri opts: %d", lua_gettop(L));
 
+            /* QUESTION: 为啥不直接使用 lua_type(L, -1)? */
+            /* TODO: 这里 lua_type() 和下面的 luaL_typename() 包含两次 lua_type() 调用，可以节约一次 */
             if (lua_type(L, 4) != LUA_TTABLE) {
                 return luaL_error(L, "expecting table as the 2nd argument for "
                                   "subrequest %d, but got %s", index,
@@ -288,6 +296,7 @@ ngx_http_lua_ngx_location_capture_multi(lua_State *L)
 
             switch (type) {
             case LUA_TTABLE:
+                /* TODO: 这个函数有些复杂，后面需要好好看看 */
                 ngx_http_lua_process_args_option(r, L, -1, &extra_args);
                 break;
 
@@ -381,6 +390,9 @@ ngx_http_lua_ngx_location_capture_multi(lua_State *L)
 
             /* check the "forward_body" option */
 
+            /* TODO: 这里可以改成和 share_all_vars/copy_all_vars 一样的实现，
+                不然 { always_forward_body = {} } 这样也可以了，不太好 */
+            /* subrequest: process always_forward_body the same way as share_all_vars/copy_all_vars */
             lua_getfield(L, 4, "always_forward_body");
             always_forward_body = lua_toboolean(L, -1);
             lua_pop(L, 1);
@@ -401,6 +413,7 @@ ngx_http_lua_ngx_location_capture_multi(lua_State *L)
                     return luaL_error(L, "Bad http request method");
                 }
 
+                /* NOTE: method 的校验在 adjust 函数中进行 */
                 method = (ngx_uint_t) lua_tonumber(L, -1);
             }
 
@@ -463,6 +476,7 @@ ngx_http_lua_ngx_location_capture_multi(lua_State *L)
                         return luaL_error(L, "no memory");
                     }
 
+                    /* TODO: 去了解一下 bufs 和 buf 的区别 */
                     body->bufs->buf = b;
                     body->bufs->next = NULL;
 
@@ -490,6 +504,9 @@ ngx_http_lua_ngx_location_capture_multi(lua_State *L)
 
         uri.data = ngx_palloc(r->pool, len);
         if (uri.data == NULL) {
+            /* TODO: 这里内存分配失败也直接 "no memory" 统一一下？
+                我看 agentzh 是专门搞了一个 commit 把 nginx side 的内存分配失败
+                的 error message 统一为 no memory，不知道为啥这里没有覆盖到 */
             return luaL_error(L, "memory allocation error");
         }
 
@@ -501,6 +518,7 @@ ngx_http_lua_ngx_location_capture_multi(lua_State *L)
 
         flags = 0;
 
+        /* TODO: 这个函数也比较复杂，后面得看看 */
         rc = ngx_http_parse_unsafe_uri(r, &uri, &args, &flags);
         if (rc != NGX_OK) {
             dd("rc = %d", (int) rc);
@@ -538,6 +556,7 @@ ngx_http_lua_ngx_location_capture_multi(lua_State *L)
             args.len = len;
         }
 
+        /* TODO: 需要去了解一下这里的 align 操作对于 ARM 等 CPU 架构的影响 */
         ofs1 = ngx_align(sizeof(ngx_http_post_subrequest_t), sizeof(void *));
         ofs2 = ngx_align(sizeof(ngx_http_lua_ctx_t), sizeof(void *));
 
@@ -547,6 +566,8 @@ ngx_http_lua_ngx_location_capture_multi(lua_State *L)
             return luaL_error(L, "no memory");
         }
 
+        /* NOTE: 在 ngx_http_finalize_request 中，如果发现调用方是一个子请求，
+            就会执行 r->post_subrequest，所以这个相当于是一个 continuation */
         psr = (ngx_http_post_subrequest_t *) p;
 
         p += ofs1;
@@ -571,9 +592,11 @@ ngx_http_lua_ngx_location_capture_multi(lua_State *L)
          *      sr_ctx->body = NULL
          */
 
+        /* TODO: 理解 ctx 和 pr_co_ctx 是如何协作的 */
         psr_data->ctx = sr_ctx;
         psr_data->pr_co_ctx = coctx;
 
+        /* TODO: 理解 psr->handler 的逻辑，这是子请求结束后回到主请求的关键(continuation) */
         psr->handler = ngx_http_lua_post_subrequest;
         psr->data = psr_data;
 
@@ -585,6 +608,7 @@ ngx_http_lua_ngx_location_capture_multi(lua_State *L)
 
         ngx_http_lua_init_ctx(sr, sr_ctx);
 
+        /* TODO: 理解 capture 字段和 lua capture filter 是如何协作的 */
         sr_ctx->capture = 1;
         sr_ctx->index = index;
         sr_ctx->last_body = &sr_ctx->body;
@@ -592,6 +616,8 @@ ngx_http_lua_ngx_location_capture_multi(lua_State *L)
 
         ngx_http_set_ctx(sr, sr_ctx, ngx_http_lua_module);
 
+        /* NOTE: adjust 函数主要是根据 capture 函数中的 option 参数的值，
+            修改 subrequest 中的某些字段(method、request_body、variables) */
         rc = ngx_http_lua_adjust_subrequest(sr, method, always_forward_body,
                                             body, vars_action, extra_vars);
 
@@ -606,6 +632,7 @@ ngx_http_lua_ngx_location_capture_multi(lua_State *L)
         /* stack: queries query uri ctx? */
 
         if (custom_ctx) {
+            /* TODO: 这个函数还没有看 */
             ngx_http_lua_ngx_set_ctx_helper(L, sr, sr_ctx, -1);
             lua_pop(L, 3);
 
@@ -622,6 +649,8 @@ ngx_http_lua_ngx_location_capture_multi(lua_State *L)
 
     ctx->no_abort = 1;
 
+    /* TODO: 理解这里 yield 的作用，去看看调用 lua_pcall()/lua_resume() 的逻辑，
+        两个 API 的区别：http://lua-users.org/lists/lua-l/2012-06/msg00172.html */
     return lua_yield(L, 0);
 }
 
@@ -638,11 +667,20 @@ ngx_http_lua_adjust_subrequest(ngx_http_request_t *sr, ngx_uint_t method,
 
     r = sr->parent;
 
+    /* QUESTION: header_in 和 headers_in 的关系？ */
     sr->header_in = r->header_in;
 
     if (body) {
         sr->request_body = body;
 
+    /* NOTE: 当 always_forward_body == true && body 参数为 nil 时，
+        会将 parent request 的 request body 转发给 subrequest，
+        如果 method 为 PUT/POST，则不管 always_forward_body 是什么，
+        都会将 parent request 的 request body 转发给 subrequest
+        By default, this option is false and when the body option
+        is not specified, the request body of the current (parent)
+        request is only forwarded when the subrequest takes the PUT
+        or POST request method.*/
     } else if (!always_forward_body
                && method != NGX_HTTP_PUT
                && method != NGX_HTTP_POST
@@ -651,6 +689,8 @@ ngx_http_lua_adjust_subrequest(ngx_http_request_t *sr, ngx_uint_t method,
         sr->request_body = NULL;
 
     } else {
+        /* TODO: 后面需要了解一下 HTTP smuggling 这个问题
+           REF: https://segmentfault.com/a/1190000023374206 */
         if (!r->headers_in.chunked) {
             pr_not_chunked = 1;
         }
@@ -739,6 +779,10 @@ ngx_http_lua_adjust_subrequest(ngx_http_request_t *sr, ngx_uint_t method,
             return NGX_ERROR;
     }
 
+    /* NOTE(1): 如果 copy_all_vars 和 share_all_vars 都指定了，那么优先使用 share
+        此外，之所以用 copy 和 share 俩字段，而不是用一个字段，非 copy share，是
+        因为除开 copy 和 share 之外，还可以不继承(copy/share)父请求的 var 列表
+       NOTE(2): 默认在 ngx_http_lua_subrequest 中已经设置 sr->var = r->var */
     if (!(vars_action & NGX_HTTP_LUA_SHARE_ALL_VARS)) {
         /* we do not inherit the parent request's variables */
         cmcf = ngx_http_get_module_main_conf(sr, ngx_http_core_module);
@@ -765,6 +809,7 @@ ngx_http_lua_adjust_subrequest(ngx_http_request_t *sr, ngx_uint_t method,
         }
     }
 
+    /* TODO: 这个函数还没有看 */
     return ngx_http_lua_subrequest_add_extra_vars(sr, extra_vars);
 }
 
@@ -843,6 +888,7 @@ ngx_http_lua_subrequest_add_extra_vars(ngx_http_request_t *sr,
 
                 v->set_handler(sr, vv, v->data);
 
+                /* NOTE: %V 表示 ngx_str_t *, %v 表示 ngx_http_variable_value_t * */
                 ngx_log_debug2(NGX_LOG_DEBUG_HTTP, sr->connection->log, 0,
                                "variable \"%V\" set to value \"%v\"", &name,
                                vv);
@@ -850,6 +896,7 @@ ngx_http_lua_subrequest_add_extra_vars(ngx_http_request_t *sr,
                 continue;
             }
 
+            /* TODO: 有 set_handler 就一定不是 INDEXED 的么？得复习一下 nginx 中的变量 */
             if (v->flags & NGX_HTTP_VAR_INDEXED) {
                 vv = &sr->variables[v->index];
 
@@ -906,6 +953,8 @@ ngx_http_lua_process_vars_option(ngx_http_request_t *r, lua_State *L,
 
     lua_pushnil(L);
     while (lua_next(L, table) != 0) {
+        /* NOTE: lua_next() pop current key，push next key/value，
+            如果下一个 key/value 不存在的话，就返回 0，并且啥也不 push */
 
         if (lua_type(L, -2) != LUA_TSTRING) {
             luaL_error(L, "attempt to use a non-string key in the "
@@ -926,19 +975,26 @@ ngx_http_lua_process_vars_option(ngx_http_request_t *r, lua_State *L,
             return;
         }
 
+        /* balus: 这里并没有拷贝，会不会导致 var->key/var->value 在 GC 后变成野指针？
+           NOTE: 从整个函数调用链来考虑，var 都存储在 ngx.location.capture() 的
+            option table 中，所以只要这个 table 还在 stack 中，var 就不会被 GC 回收 */
         var->key.data = (u_char *) lua_tolstring(L, -2, &var->key.len);
         var->value.data = (u_char *) lua_tolstring(L, -1, &var->value.len);
 
-        lua_pop(L, 1);
+        lua_pop(L, 1); /* NOTE: 把 value 给 pop 出去，留下 key 让 lua_next() 使用 */
     }
 }
 
+
+/* NOTE: 这个函数被设置为子请求的 r->post_subrequest->handler，它会在
+    子请求调用 ngx_http_finalize_request() 时被调用 */
 
 ngx_int_t
 ngx_http_lua_post_subrequest(ngx_http_request_t *r, void *data, ngx_int_t rc)
 {
     ngx_http_request_t            *pr;
     ngx_http_lua_ctx_t            *pr_ctx;
+    /* QUESTION: 下面两个结构体有啥不同？*/
     ngx_http_lua_ctx_t            *ctx; /* subrequest ctx */
     ngx_http_lua_co_ctx_t         *pr_coctx;
     size_t                         len;
@@ -950,6 +1006,8 @@ ngx_http_lua_post_subrequest(ngx_http_request_t *r, void *data, ngx_int_t rc)
 
     ctx = psr_data->ctx;
 
+    /* TODO: 这段逻辑没有理解*/
+    /* QUESTION: 对于一个 subrequest，这个函数可能会被多次调用么？*/
     if (ctx->run_post_subrequest) {
         if (r != r->connection->data) {
             r->connection->data = r;
@@ -974,18 +1032,24 @@ ngx_http_lua_post_subrequest(ngx_http_request_t *r, void *data, ngx_int_t rc)
     pr_coctx = psr_data->pr_co_ctx;
     pr_coctx->pending_subreqs--;
 
+    /* NOTE: 如果这是最后一个 subreuqest，那么当这个 subrequest
+        结束(即调用了本函数)，parent request 就可以被唤醒 */
+
     if (pr_coctx->pending_subreqs == 0) {
         dd("all subrequests are done");
 
         pr_ctx->no_abort = 0;
+        /* TODO: 理解这个 resume_handler 的作用 */
         pr_ctx->resume_handler = ngx_http_lua_subrequest_resume;
         pr_ctx->cur_co_ctx = pr_coctx;
     }
 
+    /* QUESTION: 为啥 parent request 进入过 content phase，这里的 handler 就不同了？ */
     if (pr_ctx->entered_content_phase) {
         ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "lua restoring write event handler");
 
+        /* NOTE: 这个函数只是简单地调用了一下 ctx->resume_handler() */
         pr->write_event_handler = ngx_http_lua_content_wev_handler;
 
     } else {
@@ -998,6 +1062,7 @@ ngx_http_lua_post_subrequest(ngx_http_request_t *r, void *data, ngx_int_t rc)
 
     /*  capture subrequest response status */
 
+    /* QUESTION: r->headers_out.status 和 rc 的关系？*/
     pr_coctx->sr_statuses[ctx->index] = r->headers_out.status;
 
     if (pr_coctx->sr_statuses[ctx->index] == 0) {
@@ -1014,6 +1079,24 @@ ngx_http_lua_post_subrequest(ngx_http_request_t *r, void *data, ngx_int_t rc)
         }
     }
 
+    /* NOTE: 这个字段是在 capture body filter 中设置的，一般对于一个请求(父 OR 子)，在获取/产生了
+        数据后，会先调用 ngx_http_output_filter()，然后调用 ngx_http_finalize_request()，比如：
+            server {
+                location /google {
+                    proxy_pass http://www.google.com;
+                }
+                location /bar {
+                    content_by_lua_block {
+                        ngx.location.capture("/google", { args = "q=laputa" });
+                    }
+                }
+            }
+        在 proxy_pass 的流程中，它从 Google 获取到数据后，就会使用 ngx_http_output_filter()
+        将其发送到客户端，而后在 capture body filter 中被捕获，其 body 被存放在子请求的数据结构中，
+        如果 body 已经完全读取了，那么 ctx->seen_last_for_subreq 会被置为 1，而后它会调用
+        ngx_http_finalize_request() 结束自己，此时会走到这里的流程，如果到这里 seen_last_for_subreq
+        都不为 1，说明没有获取到完整的数据，后续会根据 sr_flags 设置 response table 中的 truncated 标志
+     */
     if (!ctx->seen_last_for_subreq) {
         pr_coctx->sr_flags[ctx->index] |= NGX_HTTP_LUA_SUBREQ_TRUNCATED;
     }
@@ -1021,6 +1104,8 @@ ngx_http_lua_post_subrequest(ngx_http_request_t *r, void *data, ngx_int_t rc)
     dd("pr_coctx status: %d", (int) pr_coctx->sr_statuses[ctx->index]);
 
     /* copy subrequest response headers */
+
+    /* TODO: 下面这段逻辑还没有搞懂！*/
     if (ctx->headers_set) {
         rc = ngx_http_lua_set_content_type(r, ctx);
         if (rc != NGX_OK) {
@@ -1032,6 +1117,7 @@ ngx_http_lua_post_subrequest(ngx_http_request_t *r, void *data, ngx_int_t rc)
 
     pr_coctx->sr_headers[ctx->index] = &r->headers_out;
 
+    /* NOTE: 一下逻辑都是将 ctx->body 这个 chain 转换为线性的 body_str */
     /* copy subrequest response body */
 
     body_str = &pr_coctx->sr_bodies[ctx->index];
@@ -1071,6 +1157,8 @@ ngx_http_lua_post_subrequest(ngx_http_request_t *r, void *data, ngx_int_t rc)
 
     if (ctx->body) {
 
+        /* NOTE: 这个函数会将 body 以及 busy_bufs 中没有使用的 chain 给回收，
+            或者是直接 free 掉；或者是挂载在 free_bufs 链表上，后续可以继续使用 */
         ngx_chain_update_chains(r->pool,
                                 &pr_ctx->free_bufs, &pr_ctx->busy_bufs,
                                 &ctx->body,
@@ -1079,8 +1167,15 @@ ngx_http_lua_post_subrequest(ngx_http_request_t *r, void *data, ngx_int_t rc)
         dd("free bufs: %p", pr_ctx->free_bufs);
     }
 
+    /* QUESTION: 为啥要这句？*/
     ngx_http_post_request_to_head(pr);
 
+    /* NOTE: now ngx_lua issues subrequests without updating r->postponed at
+        all so as to allow the parent requests flush outputs immediately
+        without waiting for its running subrequests. this will pave a way for
+        subrequest integration with the upcoming lightweight thread model.
+       REF: https://forum.openresty.us/d/651-4b2e0f1ece7b9c5a30e13e1ed3f752cf */
+    /* QUESTION: 为啥直接将 r 设置为 CAR(Current Active Request)？*/
     if (r != r->connection->data) {
         r->connection->data = r;
     }
@@ -1195,6 +1290,7 @@ ngx_http_lua_handle_subreq_responses(ngx_http_request_t *r,
         part = &sr_headers->headers.part;
         header = part->elts;
 
+        /* NOTE: 学习一下 ngx_list_t 是如何遍历的 */
         for (i = 0; /* void */; i++) {
 
             if (i >= part->nelts) {
@@ -1241,19 +1337,26 @@ ngx_http_lua_handle_subreq_responses(ngx_http_request_t *r,
 
                 if (!lua_istable(co, -1)) { /* already inserted one value */
                     lua_createtable(co, 4, 0);
-                        /* stack: table key value table */
+                        /* stack: big_tb key value small_tb */
 
-                    lua_insert(co, -2); /* stack: table key table value */
-                    lua_rawseti(co, -2, 1); /* stack: table key table */
+                    /* NOTE: 这里有三次 set table 的操作：
+                        1. 将该 header 原来已有的 value 设置到 small_tb 中去，key 为 1
+                        2. 将该 header 本次新增的 value 设置到 small_tb 中去，key 为 2
+                        3. 将 small_tb 设置到 big_tb 中去，key 为 header name */
+
+                    /* NOTE: lua_insert(co, idx) 将 idx 处的元素**移动**到栈顶 */
+                    lua_insert(co, -2); /* stack: big_tb key small_tb value */
+                    lua_rawseti(co, -2, 1); /* stack: big_tb key small_tb */
 
                     lua_pushlstring(co, (char *) header[i].value.data,
                                     header[i].value.len);
-                        /* stack: table key table value */
+                        /* stack: big_tb key small_tb value */
 
+                    /* TODO: 这里可以直接使用 2 作为 key，算是一个 small optimization？*/
                     lua_rawseti(co, -2, lua_objlen(co, -2) + 1);
-                        /* stack: table key table */
+                        /* stack: big_tb key small_tb */
 
-                    lua_rawset(co, -3); /* stack: table */
+                    lua_rawset(co, -3); /* stack: big_tb */
 
                 } else {
                     lua_pushlstring(co, (char *) header[i].value.data,
@@ -1351,6 +1454,7 @@ ngx_http_lua_subrequest(ngx_http_request_t *r,
 
 #if (nginx_version >= 1009005)
 
+    /* NOTE: 初始值为 NGX_HTTP_MAX_SUBREQUESTS + 1，即 51 */
     if (r->subrequests == 0) {
 #if defined(NGX_DTRACE) && NGX_DTRACE
         ngx_http_probe_subrequest_cycle(r, uri, args);
@@ -1377,6 +1481,9 @@ ngx_http_lua_subrequest(ngx_http_request_t *r,
     }
 
 #endif
+
+    /* TODO: 相比于 nginx 目前的实现，少了 r->main->count 和
+        r->subrequest_in_memory 的检查，后续看看是否需要加上？ */
 
     sr = ngx_pcalloc(r->pool, sizeof(ngx_http_request_t));
     if (sr == NULL) {
@@ -1407,6 +1514,7 @@ ngx_http_lua_subrequest(ngx_http_request_t *r,
 
     sr->pool = r->pool;
 
+    /* TODO: 下面两行是相对于 nginx 新增的，为啥需要呢？*/
     sr->headers_in.content_length_n = -1;
     sr->headers_in.keep_alive_n = -1;
 
@@ -1416,6 +1524,7 @@ ngx_http_lua_subrequest(ngx_http_request_t *r,
 
     sr->request_body = r->request_body;
 
+    /* TODO: 是否可以直接移除 SPDY 支持？nginx 已经没有了 */
 #if (NGX_HTTP_SPDY)
     sr->spdy_stream = r->spdy_stream;
 #endif
@@ -1441,9 +1550,11 @@ ngx_http_lua_subrequest(ngx_http_request_t *r,
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, c->log, 0,
                    "lua http subrequest \"%V?%V\"", uri, &sr->args);
 
+    /* TODO: 相比于 nginx 的实现还少了对 sr->background 的赋值 */
     sr->subrequest_in_memory = (flags & NGX_HTTP_SUBREQUEST_IN_MEMORY) != 0;
     sr->waited = (flags & NGX_HTTP_SUBREQUEST_WAITED) != 0;
 
+    /* TODO: 相比于 nginx 的实现还少了 sr->schema 的赋值 */
     sr->unparsed_uri = r->unparsed_uri;
     sr->method_name = ngx_http_core_get_method;
     sr->http_protocol = r->http_protocol;
@@ -1512,6 +1623,7 @@ ngx_http_lua_subrequest_resume(ngx_http_request_t *r)
 
     dd("nsubreqs: %d", (int) coctx->nsubreqs);
 
+    /* NOTE: 构建 response table 返回给调用方 */
     ngx_http_lua_handle_subreq_responses(r, ctx);
 
     dd("free sr_statues/headers/bodies memory ASAP");
@@ -1529,6 +1641,7 @@ ngx_http_lua_subrequest_resume(ngx_http_request_t *r)
     vm = ngx_http_lua_get_lua_vm(r, ctx);
     nreqs = c->requests;
 
+    /* QUESTION: 下面是在干啥呢？为什么这里要 run thread 呢？ */
     rc = ngx_http_lua_run_thread(vm, r, ctx, coctx->nsubreqs);
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -1562,6 +1675,7 @@ ngx_http_lua_cancel_subreq(ngx_http_request_t *r)
 
 #if 1
     r->main->count--;
+    /* TODO: r->main->subrequests-- 这句似乎只有在 nginx_version <= 1009004 才有？ */
     r->main->subrequests++;
 #endif
 
