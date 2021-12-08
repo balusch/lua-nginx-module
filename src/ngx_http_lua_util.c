@@ -208,6 +208,7 @@ ngx_http_lua_set_path(ngx_cycle_t *cycle, lua_State *L, int tab_idx,
 void
 ngx_http_lua_create_new_globals_table(lua_State *L, int narr, int nrec)
 {
+    /* t = { _G = _G } */
     lua_createtable(L, narr, nrec + 1);
     lua_pushvalue(L, -1);
     lua_setfield(L, -2, "_G");

@@ -709,6 +709,10 @@ ngx_http_lua_content_by_lua(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     dd("enter");
 
+    /* QUESTION: cmd->post 一定就是 llcf->content_handler 么？
+        这样的话不是会在配置解析完毕之后就马上调用 cmd->post 么？按理
+        应该是要在请求访问该 location 时再调用？*/
+
     /*  must specify a content handler */
     if (cmd->post == NULL) {
         return NGX_CONF_ERROR;
@@ -750,6 +754,7 @@ ngx_http_lua_content_by_lua(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         llcf->content_chunkname = chunkname;
 
     } else {
+        /* NOTE: content_by_lua_file file 中的 file 可以使用 nginx 变量 */
         ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
         ccv.cf = cf;
         ccv.value = &value[1];
@@ -759,6 +764,9 @@ ngx_http_lua_content_by_lua(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             return NGX_CONF_ERROR;
         }
 
+        /* NOTE: llcf->content_src.lengths != NULL，即文件名中包含 nginx 变量时，
+            就没法在这里预先计算好 src_key，所以将 src_key 置为 NULL，等到请求到来要
+            load code 时再实时计算 */
         if (llcf->content_src.lengths == NULL) {
             /* no variable found */
             cache_key = ngx_http_lua_gen_file_cache_key(cf, value[1].data,
@@ -770,6 +778,7 @@ ngx_http_lua_content_by_lua(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     }
 
     llcf->content_src_key = cache_key;
+    /* QUESTION: 为啥 llcf->content_handler 和 cmd->post 是同一个？这样不是在指令解析完毕之后就立即执行了么？ */
     llcf->content_handler = (ngx_http_handler_pt) cmd->post;
 
     lmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_lua_module);
