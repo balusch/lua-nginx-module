@@ -488,7 +488,7 @@ struct ngx_http_lua_co_ctx_s {
                                          coroutines (entry coroutine and user
                                          threads) in the Lua registry,
                                          preventing the thread coroutine
-                                         from beging collected by the
+                                         from being collected by the
                                          Lua GC */
 
     unsigned                 waited_by_parent:1;  /* whether being waited by
