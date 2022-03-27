@@ -116,6 +116,9 @@ static ngx_int_t ngx_http_lua_handle_rewrite_jump(lua_State *L,
     ngx_http_request_t *r, ngx_http_lua_ctx_t *ctx);
 static int ngx_http_lua_thread_traceback(lua_State *L, lua_State *co,
     ngx_http_lua_co_ctx_t *coctx);
+static int ngx_http_lua_rawset(lua_State *L);
+static void ngx_http_lua_wrap_read_only_table(lua_State *L);
+static void ngx_http_lua_wrap_read_only_lib(lua_State *L);
 static void ngx_http_lua_inject_ngx_api(lua_State *L,
     ngx_http_lua_main_conf_t *lmcf, ngx_log_t *log);
 static void ngx_http_lua_inject_arg_api(lua_State *L);
@@ -864,6 +867,142 @@ ngx_http_lua_inject_ngx_api(lua_State *L, ngx_http_lua_main_conf_t *lmcf,
     lua_setglobal(L, "ngx");
 
     ngx_http_lua_inject_coroutine_api(log, L);
+
+    ngx_http_lua_wrap_read_only_lib(L);
+}
+
+
+static void ngx_http_lua_wrap_read_only_table(lua_State *L) {
+    /* precondition: original table is on the top of the stack
+     * postcondition: proxy table, which wraps the original table, is on the top of the stack */
+
+    int rc;
+    const char buf[] = "error('attempt to update a read-only table', 2)";
+
+    lua_createtable(L, 0 /* narr */, 0 /* nrec */); /* original proxy */
+    lua_createtable(L, 0 /* narr */, 3 /* nrec */); /* original proxy mt */
+
+    rc = luaL_loadbuffer(L, buf, sizeof(buf) - 1,
+                         "=read-only metatable"); /* original proxy mt closure */
+    if (rc != 0) {
+        lua_pop(L, 3); /* 3: proxy + mt + error message */
+        return;
+    }
+
+    /* TODO: more metamethods? */
+
+    lua_setfield(L, -2, "__newindex");          /* original proxy mt */
+    lua_pushvalue(L, -3);                       /* original proxy mt original */
+    lua_remove(L, -4);                          /* proxy mt original */
+    lua_setfield(L, -2, "__index");             /* proxy mt */
+    lua_pushliteral(L, "not your business");    /* proxy mt warn */
+    lua_setfield(L, -2, "__metatable");         /* proxy mt */
+    lua_setmetatable(L, -2);                    /* proxy */
+}
+
+static int ngx_http_lua_rawset(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    luaL_checkany(L, 2);
+    luaL_checkany(L, 3);
+    lua_settop(L, 3);
+
+    /* fk: first-level key, sk: second-level key */
+#define FORBID_UPDATING_INTERNAL_LIB(fk, sk)                       \
+  do {                                                             \
+    if (sk) {                                                      \
+      lua_getglobal(L, fk);                                        \
+      lua_getfield(L, -1, sk);                                     \
+    } else {                                                       \
+      lua_getglobal(L, fk);                                        \
+    }                                                              \
+    if (lua_rawequal(L, 1, -1)) {                                  \
+      return luaL_error(L, "attempt to update a read-only table"); \
+    }                                                              \
+    lua_pop(L, sk ? 2 : 1);                                        \
+  } while (0)
+
+    FORBID_UPDATING_INTERNAL_LIB(LUA_COLIBNAME, NULL);
+    FORBID_UPDATING_INTERNAL_LIB(LUA_MATHLIBNAME, NULL);
+    FORBID_UPDATING_INTERNAL_LIB(LUA_STRLIBNAME, NULL);
+    FORBID_UPDATING_INTERNAL_LIB(LUA_IOLIBNAME, NULL);
+    FORBID_UPDATING_INTERNAL_LIB(LUA_OSLIBNAME, NULL);
+    FORBID_UPDATING_INTERNAL_LIB(LUA_DBLIBNAME, NULL);
+    FORBID_UPDATING_INTERNAL_LIB(LUA_BITLIBNAME, NULL);
+    FORBID_UPDATING_INTERNAL_LIB(LUA_JITLIBNAME, NULL);
+    FORBID_UPDATING_INTERNAL_LIB(LUA_FFILIBNAME, NULL);
+    FORBID_UPDATING_INTERNAL_LIB(LUA_TABLIBNAME, NULL);
+    FORBID_UPDATING_INTERNAL_LIB(LUA_LOADLIBNAME, NULL);
+    FORBID_UPDATING_INTERNAL_LIB(LUA_LOADLIBNAME, "loaded");
+
+    FORBID_UPDATING_INTERNAL_LIB("ngx", NULL);
+    FORBID_UPDATING_INTERNAL_LIB("ngx", "req");
+    FORBID_UPDATING_INTERNAL_LIB("ngx", "resp");
+    FORBID_UPDATING_INTERNAL_LIB("ngx", "json");
+    FORBID_UPDATING_INTERNAL_LIB("ngx", "re");
+    FORBID_UPDATING_INTERNAL_LIB("ngx", "location");
+    FORBID_UPDATING_INTERNAL_LIB("ngx", "socket");
+    FORBID_UPDATING_INTERNAL_LIB("ngx", "threaad");
+    FORBID_UPDATING_INTERNAL_LIB("ngx", "timer");
+    FORBID_UPDATING_INTERNAL_LIB("ngx", "config");
+
+#undef FORBID_UPDATING_INTERNAL_LIB
+
+    lua_rawset(L, 1);
+    return 1;
+}
+
+static void ngx_http_lua_wrap_read_only_lib(lua_State *L) {
+    /* fk: first-level key, sk: second-level key */
+#define WRAP_READ_ONLY_INTERNAL_LIB(fk, sk)                     \
+  do {                                                          \
+    if (sk) {                                                   \
+      lua_getglobal(L, fk);                                     \
+      lua_getfield(L, -1, sk);                                  \
+      ngx_http_lua_wrap_read_only_table(L);                     \
+      lua_setfield(L, -2, sk);                                  \
+      lua_pop(L, 1);                                            \
+    } else {                                                    \
+      lua_getglobal(L, "package");                              \
+      lua_getfield(L, -1, "loaded");                            \
+      lua_getfield(L, -1, fk);                                  \
+      ngx_http_lua_wrap_read_only_table(L);                     \
+      lua_pushvalue(L, -1);                                     \
+      lua_setfield(L, -3, fk);                                  \
+      lua_setglobal(L, fk);                                     \
+      lua_pop(L, 2);                                            \
+    }                                                           \
+  } while (0)
+
+    WRAP_READ_ONLY_INTERNAL_LIB("ngx", "req");
+    WRAP_READ_ONLY_INTERNAL_LIB("ngx", "resp");
+    WRAP_READ_ONLY_INTERNAL_LIB("ngx", "json");
+    WRAP_READ_ONLY_INTERNAL_LIB("ngx", "re");
+    WRAP_READ_ONLY_INTERNAL_LIB("ngx", "location");
+    WRAP_READ_ONLY_INTERNAL_LIB("ngx", "socket");
+    WRAP_READ_ONLY_INTERNAL_LIB("ngx", "thread");
+    WRAP_READ_ONLY_INTERNAL_LIB("ngx", "timer");
+    WRAP_READ_ONLY_INTERNAL_LIB("ngx", "config");
+    WRAP_READ_ONLY_INTERNAL_LIB("ngx", NULL);
+
+    WRAP_READ_ONLY_INTERNAL_LIB(LUA_COLIBNAME, NULL);
+    WRAP_READ_ONLY_INTERNAL_LIB(LUA_STRLIBNAME, NULL);
+    WRAP_READ_ONLY_INTERNAL_LIB(LUA_MATHLIBNAME, NULL);
+    WRAP_READ_ONLY_INTERNAL_LIB(LUA_IOLIBNAME, NULL);
+    WRAP_READ_ONLY_INTERNAL_LIB(LUA_OSLIBNAME, NULL);
+    WRAP_READ_ONLY_INTERNAL_LIB(LUA_DBLIBNAME, NULL);
+    WRAP_READ_ONLY_INTERNAL_LIB(LUA_BITLIBNAME, NULL);
+    WRAP_READ_ONLY_INTERNAL_LIB(LUA_JITLIBNAME, NULL);
+    WRAP_READ_ONLY_INTERNAL_LIB(LUA_FFILIBNAME, NULL);
+    WRAP_READ_ONLY_INTERNAL_LIB(LUA_TABLIBNAME, NULL);
+    WRAP_READ_ONLY_INTERNAL_LIB(LUA_LOADLIBNAME, "loaded");
+    WRAP_READ_ONLY_INTERNAL_LIB(LUA_LOADLIBNAME, NULL);
+
+#undef WRAP_READ_ONLY_INTERNAL_LIB
+
+    /* rewrite rawset function */
+
+    lua_pushcfunction(L, ngx_http_lua_rawset);
+    lua_setglobal(L, "rawset");
 }
 
 
